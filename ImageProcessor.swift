@@ -27,12 +27,16 @@ class ImageProcessor: ObservableObject {
     @Published var processingImages: [NSImage] = []
     
     private let processingTimeout: TimeInterval = 60
+    private var currentRunID = UUID()
     
     /// Processes dropped image URLs and converts them to the target format.
     /// - Parameters:
     ///   - urls: Array of file URLs to process
     ///   - targetFormat: Target image format (PNG or WebP)
     func processDroppedURLs(_ urls: [URL], to targetFormat: TargetFormat) {
+        let runID = UUID()
+        self.currentRunID = runID
+        
         let previewCount = min(urls.count, 3)
         var thumbnails: [NSImage] = []
         for i in 0..<previewCount {
@@ -42,6 +46,8 @@ class ImageProcessor: ObservableObject {
         withAnimation(.easeInOut(duration: 0.3)) {
             self.isProcessing = true
             self.isSuccess = false
+            self.isError = false
+            self.errorMessage = ""
             self.activeFormat = targetFormat
             self.processingStartTime = Date()
             self.processingImages = thumbnails
@@ -69,6 +75,8 @@ class ImageProcessor: ObservableObject {
             }
             
             DispatchQueue.main.async {
+                guard self.currentRunID == runID else { return }
+                
                 if allSucceeded && !urls.isEmpty {
                     // 1. Files physically exist. Trigger Success State.
                     withAnimation(.spring(response: 0.25, dampingFraction: 0.65)) {
@@ -78,11 +86,13 @@ class ImageProcessor: ObservableObject {
                     
                     // 2. Hide UI after 3.5 seconds
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) {
+                        guard self.currentRunID == runID else { return }
                         withAnimation(.easeInOut(duration: 0.5)) {
                             self.isProcessing = false
                         }
                         
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                            guard self.currentRunID == runID else { return }
                             self.isSuccess = false
                             self.isError = false
                             self.errorMessage = ""
@@ -103,10 +113,10 @@ class ImageProcessor: ObservableObject {
                         self.processingImages = []
                     }
                     
-                    // Auto-clear error after 3 seconds (check to avoid race condition)
-                    let errorMsgToClear = errorMsg
+                    // Auto-clear error after 3 seconds
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                        if self.errorMessage == errorMsgToClear {
+                        guard self.currentRunID == runID else { return }
+                        if self.isError {
                             withAnimation {
                                 self.isError = false
                                 self.errorMessage = ""
@@ -207,7 +217,10 @@ class ImageProcessor: ObservableObject {
             if !fileExists {
                 return ProcessResult(success: false, timedOut: false, errorMessage: "WebP file was not created")
             }
-            return ProcessResult(success: result.success, timedOut: false, errorMessage: nil)
+            guard result.success else {
+                return ProcessResult(success: false, timedOut: false, errorMessage: "WebP conversion failed")
+            }
+            return ProcessResult(success: true, timedOut: false, errorMessage: nil)
             
         } else {
             // STEP 1: Lossy Color Quantization (pngquant)
@@ -249,7 +262,10 @@ class ImageProcessor: ObservableObject {
             if result2.timedOut {
                 return ProcessResult(success: true, timedOut: false, errorMessage: nil) // Step 1 still succeeded
             }
-            return ProcessResult(success: result2.success, timedOut: false, errorMessage: nil)
+            guard result2.success else {
+                return ProcessResult(success: true, timedOut: false, errorMessage: "PNG optimization failed")
+            }
+            return ProcessResult(success: true, timedOut: false, errorMessage: nil)
         }
     }
 }
