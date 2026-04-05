@@ -19,10 +19,14 @@ enum TargetFormat: Equatable {
 class ImageProcessor: ObservableObject {
     @Published var isProcessing = false
     @Published var isSuccess = false
+    @Published var isError = false
+    @Published var errorMessage: String = ""
     @Published var activeFormat: TargetFormat? = nil
     @Published var processingStartTime: Date = Date()
     @Published var successStartTime: Date = Date()
     @Published var processingImages: [NSImage] = []
+    
+    private let processingTimeout: TimeInterval = 60
     
     func processDroppedURLs(_ urls: [URL], to targetFormat: TargetFormat) {
         let previewCount = min(urls.count, 3)
@@ -41,11 +45,23 @@ class ImageProcessor: ObservableObject {
         
         DispatchQueue.global(qos: .userInitiated).async {
             var allSucceeded = true
+            var lastError: String = ""
+            var didTimeout = false
             
             // Track actual success for each file
             for url in urls {
-                let success = self.executeShellPipeline(sourceURL: url, targetFormat: targetFormat)
-                if !success { allSucceeded = false }
+                let result = self.executeShellPipeline(sourceURL: url, targetFormat: targetFormat)
+                if !result.success {
+                    allSucceeded = false
+                    if result.timedOut {
+                        didTimeout = true
+                        lastError = "Processing timed out"
+                    } else if let error = result.errorMessage {
+                        lastError = error
+                    } else {
+                        lastError = "Unknown error"
+                    }
+                }
             }
             
             DispatchQueue.main.async {
@@ -64,17 +80,31 @@ class ImageProcessor: ObservableObject {
                         
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                             self.isSuccess = false
+                            self.isError = false
+                            self.errorMessage = ""
                             self.activeFormat = nil
                             self.processingImages = []
                         }
                     }
                 } else {
                     // FAILURE STATE: Abort immediately without showing Success checkmark
-                    print("Processing failed. Aborting UI.")
+                    let errorMsg = didTimeout ? "Processing timed out after \(Int(self.processingTimeout)) seconds" : lastError
+                    print("Processing failed: \(errorMsg). Aborting UI.")
+                    
                     withAnimation(.easeInOut(duration: 0.5)) {
+                        self.isError = true
+                        self.errorMessage = errorMsg
                         self.isProcessing = false
                         self.activeFormat = nil
                         self.processingImages = []
+                    }
+                    
+                    // Auto-clear error after 3 seconds
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                        withAnimation {
+                            self.isError = false
+                            self.errorMessage = ""
+                        }
                     }
                 }
             }
@@ -91,7 +121,49 @@ class ImageProcessor: ObservableObject {
         }
     }
     
-    private func executeShellPipeline(sourceURL: URL, targetFormat: TargetFormat) -> Bool {
+    // MARK: - Process with Timeout
+    /// Runs a process with a timeout. Returns true if process completed successfully within timeout.
+    private func runProcessWithTimeout(_ process: Process, timeout: TimeInterval = 60) -> (success: Bool, timedOut: Bool) {
+        let workItem = DispatchWorkItem {
+            process.terminate()
+        }
+        
+        var didTimeout = false
+        
+        do {
+            try process.run()
+            
+            let result = DispatchSemaphore(value: 0)
+            let timeoutWorkItem = DispatchWorkItem {
+                if process.isRunning {
+                    process.terminate()
+                    didTimeout = true
+                }
+                result.signal()
+            }
+            
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutWorkItem)
+            result.wait()
+            timeoutWorkItem.cancel()
+            
+            if didTimeout {
+                return (false, true)
+            }
+            
+            process.waitUntilExit()
+            return (process.terminationStatus == 0, false)
+        } catch {
+            return (false, false)
+        }
+    }
+    
+    private struct ProcessResult {
+        var success: Bool
+        var timedOut: Bool
+        var errorMessage: String?
+    }
+    
+    private func executeShellPipeline(sourceURL: URL, targetFormat: TargetFormat) -> ProcessResult {
         // 1. Define and Create Output Directory
         let parentDirectory = sourceURL.deletingLastPathComponent()
         let optimizedDirectory = parentDirectory.appendingPathComponent("Optimized Files")
@@ -100,13 +172,17 @@ class ImageProcessor: ObservableObject {
             if !FileManager.default.fileExists(atPath: optimizedDirectory.path) {
                 try FileManager.default.createDirectory(at: optimizedDirectory, withIntermediateDirectories: true, attributes: nil)
             }
-        } catch { return false }
+        } catch { 
+            return ProcessResult(success: false, timedOut: false, errorMessage: "Failed to create output directory") 
+        }
         
         // 2. Keep Exact Original Filename
         let originalName = sourceURL.deletingPathExtension().lastPathComponent
         
         if targetFormat == .webp {
-            guard let cwebpPath = Bundle.main.path(forResource: "cwebp", ofType: nil) else { return false }
+            guard let cwebpPath = Bundle.main.path(forResource: "cwebp", ofType: nil) else { 
+                return ProcessResult(success: false, timedOut: false, errorMessage: "cwebp binary not found") 
+            }
             grantExecutablePermissions(to: cwebpPath)
             
             let finalURL = optimizedDirectory.appendingPathComponent(originalName).appendingPathExtension("webp")
@@ -117,15 +193,21 @@ class ImageProcessor: ObservableObject {
             // Upgraded: Added -m 6 (max compression) and -mt (multi-threading)
             process.arguments = ["-q", "\(webpQ)", "-m", "6", "-mt", sourceURL.path, "-o", finalURL.path]
             
-            do {
-                try process.run()
-                process.waitUntilExit()
-                return FileManager.default.fileExists(atPath: finalURL.path)
-            } catch { return false }
+            let result = runProcessWithTimeout(process, timeout: processingTimeout)
+            if result.timedOut {
+                return ProcessResult(success: false, timedOut: true, errorMessage: "WebP conversion timed out")
+            }
+            let fileExists = FileManager.default.fileExists(atPath: finalURL.path)
+            if !fileExists {
+                return ProcessResult(success: false, timedOut: false, errorMessage: "WebP file was not created")
+            }
+            return ProcessResult(success: result.success, timedOut: false, errorMessage: nil)
             
         } else {
             // STEP 1: Lossy Color Quantization (pngquant)
-            guard let pngquantPath = Bundle.main.path(forResource: "pngquant", ofType: nil) else { return false }
+            guard let pngquantPath = Bundle.main.path(forResource: "pngquant", ofType: nil) else { 
+                return ProcessResult(success: false, timedOut: false, errorMessage: "pngquant binary not found") 
+            }
             grantExecutablePermissions(to: pngquantPath)
             
             let finalURL = optimizedDirectory.appendingPathComponent(originalName).appendingPathExtension("png")
@@ -137,15 +219,19 @@ class ImageProcessor: ObservableObject {
             // Upgraded: Added --speed 1 (max effort) and --strip (removes metadata bloat)
             process1.arguments = ["--quality=\(pngMin)-\(pngMax)", "--speed", "1", "--strip", "--force", sourceURL.path, "--output", finalURL.path]
             
-            do {
-                try process1.run()
-                process1.waitUntilExit()
-                guard process1.terminationStatus == 0 && FileManager.default.fileExists(atPath: finalURL.path) else { return false }
-            } catch { return false }
+            let result1 = runProcessWithTimeout(process1, timeout: processingTimeout)
+            if result1.timedOut {
+                return ProcessResult(success: false, timedOut: true, errorMessage: "PNG quantization timed out")
+            }
+            guard result1.success && FileManager.default.fileExists(atPath: finalURL.path) else { 
+                return ProcessResult(success: false, timedOut: false, errorMessage: "PNG quantization failed") 
+            }
             
             // STEP 2: Lossless Deflation (oxipng)
             // Fails silently and returns the pngquant version if oxipng isn't bundled yet
-            guard let oxipngPath = Bundle.main.path(forResource: "oxipng", ofType: nil) else { return true }
+            guard let oxipngPath = Bundle.main.path(forResource: "oxipng", ofType: nil) else { 
+                return ProcessResult(success: true, timedOut: false, errorMessage: nil) 
+            }
             grantExecutablePermissions(to: oxipngPath)
             
             let process2 = Process()
@@ -153,11 +239,11 @@ class ImageProcessor: ObservableObject {
             // -o 4 is optimal max effort. Overwrites the file in-place.
             process2.arguments = ["-o", "4", "--strip", "safe", finalURL.path]
             
-            do {
-                try process2.run()
-                process2.waitUntilExit()
-                return process2.terminationStatus == 0
-            } catch { return true } // Return true because Step 1 still succeeded
+            let result2 = runProcessWithTimeout(process2, timeout: processingTimeout)
+            if result2.timedOut {
+                return ProcessResult(success: true, timedOut: false, errorMessage: nil) // Step 1 still succeeded
+            }
+            return ProcessResult(success: result2.success, timedOut: false, errorMessage: nil)
         }
     }
 }

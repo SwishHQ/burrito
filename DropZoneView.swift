@@ -164,6 +164,26 @@ struct DropZoneView: View {
                                             .foregroundColor(.white)
                                             .padding(.bottom, 16)
                                             .transition(.opacity)
+                                    } else if processor.isError {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .font(.system(size: 42))
+                                            .foregroundColor(Color.red.opacity(0.8))
+                                            .shadow(color: Color.red.opacity(0.5), radius: 8, x: 0, y: 0)
+                                            .transition(.scale.combined(with: .opacity))
+
+                                        Text("FAILED")
+                                            .font(.system(size: 12, weight: .bold, design: .rounded))
+                                            .tracking(2.0)
+                                            .foregroundColor(.white)
+                                            .padding(.bottom, 8)
+                                            .transition(.opacity)
+
+                                        Text(processor.errorMessage)
+                                            .font(.system(size: 10, weight: .medium, design: .rounded))
+                                            .foregroundColor(.white.opacity(0.7))
+                                            .multilineTextAlignment(.center)
+                                            .padding(.horizontal, 16)
+                                            .transition(.opacity)
                                     } else {
                                         FannedImageStack(images: processor.processingImages)
                                             .transition(.scale.combined(with: .opacity))
@@ -203,7 +223,7 @@ struct DropZoneView: View {
             .padding(2)
             .overlay(
                 RoundedRectangle(cornerRadius: 12)
-                    .stroke(processor.isProcessing ? (processor.isSuccess ? Color.green.opacity(0.4) : Color.white.opacity(0.3)) : Color.white.opacity(0.15), style: StrokeStyle(lineWidth: 2, dash: [6, 6]))
+                    .stroke(processor.isProcessing ? (processor.isSuccess ? Color.green.opacity(0.4) : (processor.isError ? Color.red.opacity(0.4) : Color.white.opacity(0.3))) : Color.white.opacity(0.15), style: StrokeStyle(lineWidth: 2, dash: [6, 6]))
                     .animation(.easeInOut, value: processor.isProcessing)
             )
             .padding(12)
