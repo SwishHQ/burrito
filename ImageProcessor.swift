@@ -28,6 +28,10 @@ class ImageProcessor: ObservableObject {
     
     private let processingTimeout: TimeInterval = 60
     
+    /// Processes dropped image URLs and converts them to the target format.
+    /// - Parameters:
+    ///   - urls: Array of file URLs to process
+    ///   - targetFormat: Target image format (PNG or WebP)
     func processDroppedURLs(_ urls: [URL], to targetFormat: TargetFormat) {
         let previewCount = min(urls.count, 3)
         var thumbnails: [NSImage] = []
@@ -99,11 +103,14 @@ class ImageProcessor: ObservableObject {
                         self.processingImages = []
                     }
                     
-                    // Auto-clear error after 3 seconds
+                    // Auto-clear error after 3 seconds (check to avoid race condition)
+                    let errorMsgToClear = errorMsg
                     DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                        withAnimation {
-                            self.isError = false
-                            self.errorMessage = ""
+                        if self.errorMessage == errorMsgToClear {
+                            withAnimation {
+                                self.isError = false
+                                self.errorMessage = ""
+                            }
                         }
                     }
                 }
@@ -112,7 +119,8 @@ class ImageProcessor: ObservableObject {
     }
     
     // MARK: - Hardened Runtime Fix
-    /// Programmatically forces macOS to treat the binary as an executable, bypassing Archive stripping
+    /// Programmatically forces macOS to treat the binary as an executable, bypassing Archive stripping.
+    /// - Parameter path: The file path to the binary
     private func grantExecutablePermissions(to path: String) {
         do {
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
@@ -122,47 +130,45 @@ class ImageProcessor: ObservableObject {
     }
     
     // MARK: - Process with Timeout
-    /// Runs a process with a timeout. Returns true if process completed successfully within timeout.
+    /// Runs a process with a timeout. Returns success status and whether it timed out.
+    /// - Parameters:
+    ///   - process: The Process to run
+    ///   - timeout: Maximum time to wait in seconds (default 60)
+    /// - Returns: Tuple containing success (bool) and timedOut (bool)
     private func runProcessWithTimeout(_ process: Process, timeout: TimeInterval = 60) -> (success: Bool, timedOut: Bool) {
-        let workItem = DispatchWorkItem {
-            process.terminate()
-        }
+        let semaphore = DispatchSemaphore(value: 0)
         
-        var didTimeout = false
+        process.terminationHandler = { _ in
+            semaphore.signal()
+        }
         
         do {
             try process.run()
-            
-            let result = DispatchSemaphore(value: 0)
-            let timeoutWorkItem = DispatchWorkItem {
-                if process.isRunning {
-                    process.terminate()
-                    didTimeout = true
-                }
-                result.signal()
-            }
-            
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutWorkItem)
-            result.wait()
-            timeoutWorkItem.cancel()
-            
-            if didTimeout {
-                return (false, true)
-            }
-            
-            process.waitUntilExit()
-            return (process.terminationStatus == 0, false)
         } catch {
             return (false, false)
         }
+        
+        let timeoutResult = semaphore.wait(timeout: .now() + timeout)
+        
+        if timeoutResult == .timedOut {
+            if process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+            }
+            return (false, true)
+        }
+        
+        return (process.terminationStatus == 0, false)
     }
     
+    /// Result structure for shell pipeline execution
     private struct ProcessResult {
         var success: Bool
         var timedOut: Bool
         var errorMessage: String?
     }
     
+    /// Executes the shell pipeline to convert an image to the target format
     private func executeShellPipeline(sourceURL: URL, targetFormat: TargetFormat) -> ProcessResult {
         // 1. Define and Create Output Directory
         let parentDirectory = sourceURL.deletingLastPathComponent()

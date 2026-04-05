@@ -108,9 +108,9 @@ struct DropZoneView: View {
                 .allowsHitTesting(!processor.isProcessing) // Disables drops when hidden
                 
                 
-                // LAYER 2: COMBINED PROCESSING ZONE (Fades in when processing)
+                // LAYER 2: COMBINED PROCESSING ZONE (Fades in when processing or error)
                 GeometryReader { geo in
-                    if processor.isProcessing {
+                    if processor.isProcessing || processor.isError {
                         TimelineView(.animation(minimumInterval: 1/60)) { timeline in
                             let elapsedTime = timeline.date.timeIntervalSince(processor.processingStartTime)
                             let dropTime = elapsedTime.truncatingRemainder(dividingBy: 2.0)
@@ -197,6 +197,7 @@ struct DropZoneView: View {
                                     }
                                 }
                                 .animation(.spring(response: 0.10, dampingFraction: 0.65), value: processor.isSuccess)
+                                .animation(.spring(response: 0.10, dampingFraction: 0.65), value: processor.isError)
                             }
                             .layerEffect(
                                 ShaderLibrary.Ripple(
