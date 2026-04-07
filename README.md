@@ -21,7 +21,7 @@ https://github.com/user-attachments/assets/de94b2fd-c711-46d1-b790-6626954f07af
 
 ```bash
 curl -L -o Burrito.dmg \
-  https://github.com/saranonearth/Burrito/releases/download/v1.0.0/Burrito.dmg
+  https://github.com/SwishHQ/burrito/releases/latest/download/Burrito.dmg
 open Burrito.dmg
 ```
 
