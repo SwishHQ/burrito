@@ -19,6 +19,9 @@ enum TargetFormat: Equatable {
 class ImageProcessor: ObservableObject {
     @Published var isProcessing = false
     @Published var isSuccess = false
+    @Published var isError = false
+    @Published var errorMessage: String? = nil
+    @Published var savingsPercentage: Int? = nil
     @Published var activeFormat: TargetFormat? = nil
     @Published var processingStartTime: Date = Date()
     @Published var successStartTime: Date = Date()
@@ -34,22 +37,38 @@ class ImageProcessor: ObservableObject {
         withAnimation(.easeInOut(duration: 0.3)) {
             self.isProcessing = true
             self.isSuccess = false
+            self.isError = false
+            self.errorMessage = nil
+            self.savingsPercentage = nil
             self.activeFormat = targetFormat
             self.processingStartTime = Date()
             self.processingImages = thumbnails
         }
         
         DispatchQueue.global(qos: .userInitiated).async {
-            var allSucceeded = true
+            var firstError: String? = nil
+            var totalOriginalSize: Int64 = 0
+            var totalOptimizedSize: Int64 = 0
             
             // Track actual success for each file
             for url in urls {
-                let success = self.executeShellPipeline(sourceURL: url, targetFormat: targetFormat)
-                if !success { allSucceeded = false }
+                let (error, originalSize, optimizedSize) = self.executeShellPipeline(sourceURL: url, targetFormat: targetFormat)
+                if let error = error {
+                    firstError = error
+                    break
+                }
+                totalOriginalSize += originalSize
+                totalOptimizedSize += optimizedSize
             }
             
             DispatchQueue.main.async {
-                if allSucceeded && !urls.isEmpty {
+                if firstError == nil && !urls.isEmpty {
+                    // Calculate savings
+                    if totalOriginalSize > 0 {
+                        let savings = Double(totalOriginalSize - totalOptimizedSize) / Double(totalOriginalSize)
+                        self.savingsPercentage = max(0, Int(savings * 100))
+                    }
+
                     // 1. Files physically exist. Trigger Success State.
                     withAnimation(.spring(response: 0.25, dampingFraction: 0.65)) {
                         self.isSuccess = true
@@ -64,17 +83,32 @@ class ImageProcessor: ObservableObject {
                         
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                             self.isSuccess = false
+                            self.savingsPercentage = nil
                             self.activeFormat = nil
                             self.processingImages = []
                         }
                     }
                 } else {
-                    // FAILURE STATE: Abort immediately without showing Success checkmark
-                    print("Processing failed. Aborting UI.")
-                    withAnimation(.easeInOut(duration: 0.5)) {
-                        self.isProcessing = false
-                        self.activeFormat = nil
-                        self.processingImages = []
+                    // FAILURE STATE: Show Error UI then reset
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.65)) {
+                        self.isError = true
+                        self.errorMessage = firstError ?? "Unknown error occurred"
+                        self.successStartTime = Date() // Use this for ripple timing
+                    }
+                    
+                    // Hide UI after 4 seconds (slightly longer to read error)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) {
+                        withAnimation(.easeInOut(duration: 0.5)) {
+                            self.isProcessing = false
+                        }
+                        
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                            self.isError = false
+                            self.errorMessage = nil
+                            self.savingsPercentage = nil
+                            self.activeFormat = nil
+                            self.processingImages = []
+                        }
                     }
                 }
             }
@@ -91,7 +125,9 @@ class ImageProcessor: ObservableObject {
         }
     }
     
-    private func executeShellPipeline(sourceURL: URL, targetFormat: TargetFormat) -> Bool {
+    private func executeShellPipeline(sourceURL: URL, targetFormat: TargetFormat) -> (error: String?, originalSize: Int64, optimizedSize: Int64) {
+        let originalSize = (try? FileManager.default.attributesOfItem(atPath: sourceURL.path)[.size] as? Int64) ?? 0
+        
         // 1. Define and Create Output Directory
         let parentDirectory = sourceURL.deletingLastPathComponent()
         let optimizedDirectory = parentDirectory.appendingPathComponent("Optimized Files")
@@ -100,13 +136,13 @@ class ImageProcessor: ObservableObject {
             if !FileManager.default.fileExists(atPath: optimizedDirectory.path) {
                 try FileManager.default.createDirectory(at: optimizedDirectory, withIntermediateDirectories: true, attributes: nil)
             }
-        } catch { return false }
+        } catch { return ("FOLDER ERROR", 0, 0) }
         
         // 2. Keep Exact Original Filename
         let originalName = sourceURL.deletingPathExtension().lastPathComponent
         
         if targetFormat == .webp {
-            guard let cwebpPath = Bundle.main.path(forResource: "cwebp", ofType: nil) else { return false }
+            guard let cwebpPath = Bundle.main.path(forResource: "cwebp", ofType: nil) else { return ("BINARY MISSING", 0, 0) }
             grantExecutablePermissions(to: cwebpPath)
             
             let finalURL = optimizedDirectory.appendingPathComponent(originalName).appendingPathExtension("webp")
@@ -120,12 +156,17 @@ class ImageProcessor: ObservableObject {
             do {
                 try process.run()
                 process.waitUntilExit()
-                return FileManager.default.fileExists(atPath: finalURL.path)
-            } catch { return false }
+                if FileManager.default.fileExists(atPath: finalURL.path) {
+                    let optimizedSize = (try? FileManager.default.attributesOfItem(atPath: finalURL.path)[.size] as? Int64) ?? 0
+                    return (nil, originalSize, optimizedSize)
+                } else {
+                    return ("CONVERSION FAILED", 0, 0)
+                }
+            } catch { return ("EXECUTION ERROR", 0, 0) }
             
         } else {
             // STEP 1: Lossy Color Quantization (pngquant)
-            guard let pngquantPath = Bundle.main.path(forResource: "pngquant", ofType: nil) else { return false }
+            guard let pngquantPath = Bundle.main.path(forResource: "pngquant", ofType: nil) else { return ("BINARY MISSING", 0, 0) }
             grantExecutablePermissions(to: pngquantPath)
             
             let finalURL = optimizedDirectory.appendingPathComponent(originalName).appendingPathExtension("png")
@@ -140,12 +181,17 @@ class ImageProcessor: ObservableObject {
             do {
                 try process1.run()
                 process1.waitUntilExit()
-                guard process1.terminationStatus == 0 && FileManager.default.fileExists(atPath: finalURL.path) else { return false }
-            } catch { return false }
+                guard process1.terminationStatus == 0 && FileManager.default.fileExists(atPath: finalURL.path) else {
+                    return ("OPTIMIZATION FAILED", 0, 0)
+                }
+            } catch { return ("EXECUTION ERROR", 0, 0) }
             
             // STEP 2: Lossless Deflation (oxipng)
             // Fails silently and returns the pngquant version if oxipng isn't bundled yet
-            guard let oxipngPath = Bundle.main.path(forResource: "oxipng", ofType: nil) else { return true }
+            guard let oxipngPath = Bundle.main.path(forResource: "oxipng", ofType: nil) else { 
+                let optimizedSize = (try? FileManager.default.attributesOfItem(atPath: finalURL.path)[.size] as? Int64) ?? 0
+                return (nil, originalSize, optimizedSize)
+            }
             grantExecutablePermissions(to: oxipngPath)
             
             let process2 = Process()
@@ -156,8 +202,12 @@ class ImageProcessor: ObservableObject {
             do {
                 try process2.run()
                 process2.waitUntilExit()
-                return process2.terminationStatus == 0
-            } catch { return true } // Return true because Step 1 still succeeded
+                let optimizedSize = (try? FileManager.default.attributesOfItem(atPath: finalURL.path)[.size] as? Int64) ?? 0
+                return (nil, originalSize, optimizedSize)
+            } catch { 
+                let optimizedSize = (try? FileManager.default.attributesOfItem(atPath: finalURL.path)[.size] as? Int64) ?? 0
+                return (nil, originalSize, optimizedSize)
+            }
         }
     }
 }
