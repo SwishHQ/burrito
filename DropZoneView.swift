@@ -1,6 +1,10 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+extension Color {
+    static let burritoAmber = Color(red: 0.91, green: 0.66, blue: 0.09)
+}
+
 // Fanned preview stack
 struct FannedImageStack: View {
     var images: [NSImage]
@@ -45,11 +49,177 @@ struct FannedImageStack: View {
     }
 }
 
+struct ShakeEffect: GeometryEffect {
+    var shakes: CGFloat = 0
+    var animatableData: CGFloat {
+        get { shakes }
+        set { shakes = newValue }
+    }
+
+    func effectValue(size: CGSize) -> ProjectionTransform {
+        let translation = 6 * sin(shakes * .pi * 2)
+        return ProjectionTransform(CGAffineTransform(translationX: translation, y: 0))
+    }
+}
+
+struct ErrorIconView: View {
+    @State private var shakeCount: CGFloat = 0
+
+    var body: some View {
+        Image(systemName: "exclamationmark.triangle.fill")
+            .font(.system(size: 42))
+            .foregroundColor(.burritoAmber)
+            .shadow(color: .burritoAmber.opacity(0.5), radius: 8, x: 0, y: 0)
+            .modifier(ShakeEffect(shakes: shakeCount))
+            .onAppear {
+                withAnimation(.easeOut(duration: 0.4)) {
+                    shakeCount = 3
+                }
+            }
+    }
+}
+
+private struct ProcessingLayerView: View {
+    @ObservedObject var processor: ImageProcessor
+
+    var body: some View {
+        GeometryReader { geo in
+            if processor.isProcessing {
+                TimelineView(.animation(minimumInterval: 1/60)) { timeline in
+                    let elapsedTime = timeline.date.timeIntervalSince(processor.processingStartTime)
+                    let dropTime = elapsedTime.truncatingRemainder(dividingBy: 2.0)
+                    let successTime = timeline.date.timeIntervalSince(processor.successStartTime)
+                    let errorTime = timeline.date.timeIntervalSince(processor.errorStartTime)
+
+                    let isSuccess = processor.isSuccess
+                    let isError = processor.isError
+                    let rippleParams: (Double, Float, Float, Float, Float) = {
+                        if isSuccess { return (successTime, 1.5, 20.0, 5.0, 900.0) }
+                        if isError   { return (errorTime,   1.2, 22.0, 7.0, 800.0) }
+                        return (dropTime, 12.0, 15.0, 8.0, 1000.0)
+                    }()
+                    let rippleTime  = rippleParams.0
+                    let amplitude   = rippleParams.1
+                    let frequency   = rippleParams.2
+                    let decay       = rippleParams.3
+                    let speed       = rippleParams.4
+
+                    ZStack {
+                        backgroundBlobs(geo: geo, elapsedTime: elapsedTime, isError: isError, isSuccess: isSuccess)
+                        foregroundContent(isSuccess: isSuccess, isError: isError)
+                    }
+                    .layerEffect(
+                        ShaderLibrary.Ripple(
+                            .float2(Float(geo.size.width / 2), Float(geo.size.height / 2)),
+                            .float(Float(rippleTime)),
+                            .float(amplitude),
+                            .float(frequency),
+                            .float(decay),
+                            .float(speed)
+                        ),
+                        maxSampleOffset: CGSize(width: 40, height: 40),
+                        isEnabled: true
+                    )
+                }
+                .transition(.opacity)
+            }
+        }
+        .allowsHitTesting(processor.isProcessing)
+    }
+
+    @ViewBuilder
+    private func backgroundBlobs(geo: GeometryProxy, elapsedTime: TimeInterval, isError: Bool, isSuccess: Bool) -> some View {
+        ZStack {
+            Color.black
+            Circle()
+                .fill(
+                    (isError
+                        ? Color.burritoAmber
+                        : Color(red: 0.20, green: 0.764, blue: 0.388))
+                    .opacity(isSuccess ? 0.6 : (isError ? 0.5 : 0.3))
+                )
+                .frame(width: 160)
+                .blur(radius: isError ? 35 : 40)
+                .offset(x: -40, y: -20)
+            Circle()
+                .fill(Color.white.opacity(0.15))
+                .frame(width: 140)
+                .blur(radius: 40)
+                .offset(x: 50, y: 30)
+        }
+        .scaleEffect(1.2)
+        .layerEffect(
+            ShaderLibrary.modernFluid(
+                .float(elapsedTime),
+                .float2(Float(geo.size.width), Float(geo.size.height))
+            ),
+            maxSampleOffset: CGSize(width: 10, height: 10)
+        )
+    }
+
+    @ViewBuilder
+    private func foregroundContent(isSuccess: Bool, isError: Bool) -> some View {
+        VStack(spacing: 12) {
+            Spacer()
+            if isSuccess {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 42))
+                    .foregroundColor(Color(red: 0.2, green: 0.8, blue: 0.4))
+                    .shadow(color: Color(red: 0.2, green: 0.8, blue: 0.4).opacity(0.5), radius: 8, x: 0, y: 0)
+                    .transition(.scale.combined(with: .opacity))
+                Text("SUCCESS")
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .tracking(2.0)
+                    .foregroundColor(.white)
+                    .padding(.bottom, 16)
+                    .transition(.opacity)
+            } else if isError {
+                ErrorIconView()
+                    .transition(.scale.combined(with: .opacity))
+                Text("FAILED")
+                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                    .tracking(2.0)
+                    .foregroundColor(.white)
+                    .padding(.bottom, 16)
+                    .transition(.opacity)
+            } else {
+                FannedImageStack(images: processor.processingImages)
+                    .transition(.scale.combined(with: .opacity))
+                Text("PROCESSING \(processor.activeFormat == .png ? "PNG" : "WEBP")")
+                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                    .tracking(1.5)
+                    .foregroundColor(.white.opacity(0.9))
+                    .padding(.bottom, 16)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.spring(response: 0.10, dampingFraction: 0.65), value: processor.isSuccess)
+        .animation(.spring(response: 0.08, dampingFraction: 0.70), value: processor.isError)
+    }
+}
+
 struct DropZoneView: View {
     @Binding var showSettings: Bool
     @StateObject var processor = ImageProcessor()
     @State private var isTargetedPNG = false
     @State private var isTargetedWebP = false
+
+    private var borderStrokeColor: Color {
+        let isProcessing = processor.isProcessing
+        let isSuccess = processor.isSuccess
+        let isError = processor.isError
+        
+        if isProcessing {
+            if isSuccess {
+                return Color.green.opacity(0.4)
+            }
+            if isError {
+                return Color.burritoAmber.opacity(0.4)
+            }
+            return Color.white.opacity(0.3)
+        }
+        return Color.white.opacity(0.15)
+    }
     
     var body: some View {
         VStack(spacing: 0) {
@@ -109,92 +279,7 @@ struct DropZoneView: View {
                 
                 
                 // LAYER 2: COMBINED PROCESSING ZONE (Fades in when processing)
-                GeometryReader { geo in
-                    if processor.isProcessing {
-                        TimelineView(.animation(minimumInterval: 1/60)) { timeline in
-                            let elapsedTime = timeline.date.timeIntervalSince(processor.processingStartTime)
-                            let dropTime = elapsedTime.truncatingRemainder(dividingBy: 2.0)
-                            let successTime = timeline.date.timeIntervalSince(processor.successStartTime)
-
-                            let isSuccess = processor.isSuccess
-                            let rippleTime = isSuccess ? successTime : dropTime
-                            let amplitude: Float = isSuccess ? 1.5 : 12.0
-                            let frequency: Float = isSuccess ? 20.0 : 15.0
-                            let decay: Float     = isSuccess ? 5.0 : 8.0
-                            let speed: Float     = isSuccess ? 900.0 : 1000.0
-
-                            ZStack {
-                                // Background
-                                ZStack {
-                                    Color.black
-                                    Circle()
-                                        .fill(Color(red: 0.20, green: 0.764, blue: 0.388).opacity(isSuccess ? 0.6 : 0.3))
-                                        .frame(width: 160)
-                                        .blur(radius: 40)
-                                        .offset(x: -40, y: -20)
-                                    Circle()
-                                        .fill(Color.white.opacity(0.15))
-                                        .frame(width: 140)
-                                        .blur(radius: 40)
-                                        .offset(x: 50, y: 30)
-                                }
-                                .scaleEffect(1.2)
-                                .layerEffect(
-                                    ShaderLibrary.modernFluid(
-                                        .float(elapsedTime),
-                                        .float2(Float(geo.size.width), Float(geo.size.height))
-                                    ),
-                                    maxSampleOffset: CGSize(width: 10, height: 10)
-                                )
-
-                                // Foreground
-                                VStack(spacing: 12) {
-                                    Spacer()
-
-                                    if processor.isSuccess {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .font(.system(size: 42))
-                                            .foregroundColor(Color(red: 0.2, green: 0.8, blue: 0.4))
-                                            .shadow(color: Color(red: 0.2, green: 0.8, blue: 0.4).opacity(0.5), radius: 8, x: 0, y: 0)
-                                            .transition(.scale.combined(with: .opacity))
-
-                                        Text("SUCCESS")
-                                            .font(.system(size: 12, weight: .bold, design: .rounded))
-                                            .tracking(2.0)
-                                            .foregroundColor(.white)
-                                            .padding(.bottom, 16)
-                                            .transition(.opacity)
-                                    } else {
-                                        FannedImageStack(images: processor.processingImages)
-                                            .transition(.scale.combined(with: .opacity))
-
-                                        Text("PROCESSING \(processor.activeFormat == .png ? "PNG" : "WEBP")")
-                                            .font(.system(size: 11, weight: .bold, design: .rounded))
-                                            .tracking(1.5)
-                                            .foregroundColor(.white.opacity(0.9))
-                                            .padding(.bottom, 16)
-                                            .transition(.opacity)
-                                    }
-                                }
-                                .animation(.spring(response: 0.10, dampingFraction: 0.65), value: processor.isSuccess)
-                            }
-                            .layerEffect(
-                                ShaderLibrary.Ripple(
-                                    .float2(Float(geo.size.width / 2), Float(geo.size.height / 2)),
-                                    .float(Float(rippleTime)),
-                                    .float(amplitude),
-                                    .float(frequency),
-                                    .float(decay),
-                                    .float(speed)
-                                ),
-                                maxSampleOffset: CGSize(width: 40, height: 40),
-                                isEnabled: true
-                            )
-                        }
-                        .transition(.opacity)
-                    }
-                }
-                .allowsHitTesting(processor.isProcessing)
+                ProcessingLayerView(processor: processor)
                 
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -203,7 +288,7 @@ struct DropZoneView: View {
             .padding(2)
             .overlay(
                 RoundedRectangle(cornerRadius: 12)
-                    .stroke(processor.isProcessing ? (processor.isSuccess ? Color.green.opacity(0.4) : Color.white.opacity(0.3)) : Color.white.opacity(0.15), style: StrokeStyle(lineWidth: 2, dash: [6, 6]))
+                    .stroke(borderStrokeColor, style: StrokeStyle(lineWidth: 2, dash: [6, 6]))
                     .animation(.easeInOut, value: processor.isProcessing)
             )
             .padding(12)
@@ -230,3 +315,4 @@ struct DropZoneView: View {
         return true
     }
 }
+
